@@ -185,8 +185,9 @@ class BasicTrainer(object):
         # FSDP generation according to https://github.com/pytorch/pytorch/issues/100069
         ctx = lambda: (FSDP.summon_full_params(self.policy, writeback=False, recurse=False) if 'FSDP' in self.config.trainer else contextlib.nullcontext())
         with ctx():
-            policy_output = self.policy.generate(
-                batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                policy_output = self.policy.generate(
+                    batch['prompt_input_ids'], attention_mask=batch['prompt_attention_mask'], max_length=self.config.max_length, do_sample=True, pad_token_id=self.tokenizer.pad_token_id)
 
         if self.config.loss.name in {'dpo', 'ipo'}:
             ctx = lambda: (FSDP.summon_full_params(self.reference_model, writeback=False, recurse=False) if 'FSDP' in self.config.trainer else contextlib.nullcontext())
