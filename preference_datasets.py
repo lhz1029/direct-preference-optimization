@@ -131,8 +131,8 @@ def get_editor_data(data):
             rejected = data[prompt]["responses"][pair[1]]
             new_prompt = prompt.rsplit("\n\nAssistant:", 1)[0] + "\n\nCandidate Response:" + rejected + "\n\nAssistant:"
             new_data[new_prompt] = {
-                "pairs": [pair],
-                "responses": [r for i, r in enumerate(responses) if i in pair],
+                "pairs": [(0, 1)],
+                "responses": [r for i, r in enumerate(responses) if i == pair[0]] + [r for i, r in enumerate(responses) if i == pair[1]],
                 "sft_target": sft_target,
             }
     del data

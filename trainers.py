@@ -175,9 +175,16 @@ class BasicTrainer(object):
 
         self.train_iterator = get_batch_iterator(**data_iterator_kwargs, split='train', n_epochs=config.n_epochs, n_examples=config.n_examples, batch_size=config.batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
         rank0_print(f'Loaded train data iterator')
-        self.eval_iterator = get_batch_iterator(**data_iterator_kwargs, split='test', n_examples=config.n_eval_examples, batch_size=config.eval_batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
-        self.eval_batches = list(self.eval_iterator)
-        rank0_print(f'Loaded {len(self.eval_batches)} eval batches of size {config.eval_batch_size}')
+        # separate out eval datasets by name
+        self.all_eval_batches = {}
+        print(config.datasets)
+        for name in config.datasets:
+            print(name)
+            data_iterator_kwargs.update(names=[name])
+            eval_iterator = get_batch_iterator(**data_iterator_kwargs, split='test', n_examples=config.n_eval_examples, batch_size=config.eval_batch_size, silent=rank != 0, cache_dir=get_local_dir(config.local_dirs))
+            eval_batches = list(eval_iterator)
+            self.all_eval_batches[name] = eval_batches
+            rank0_print(f'Loaded {len(eval_batches)} eval batches of size {config.eval_batch_size}')
 
     def get_batch_samples(self, batch: Dict[str, torch.LongTensor]) -> Tuple[str, str]:
         """Generate samples from the policy (and reference model, if doing DPO training) for the given batch of inputs."""
@@ -221,11 +228,10 @@ class BasicTrainer(object):
         return chosen_logps, rejected_logps
 
 
-    def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, train=True):
+    def get_batch_metrics(self, batch: Dict[str, Union[List, torch.LongTensor]], loss_config: DictConfig, split_name="train"):
         """Compute the SFT or DPO loss and other metrics for the given batch of inputs."""
 
         metrics = {}
-        train_test = 'train' if train else 'eval'
 
         policy_chosen_logps, policy_rejected_logps = self.concatenated_forward(self.policy, batch)
         if loss_config.name in {'dpo', 'ipo'}:
@@ -248,10 +254,10 @@ class BasicTrainer(object):
             rejected_rewards = all_gather_if_needed(rejected_rewards, self.rank, self.world_size)
             reward_accuracies = all_gather_if_needed(reward_accuracies, self.rank, self.world_size)
 
-            metrics[f'rewards_{train_test}/chosen'] = chosen_rewards.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/rejected'] = rejected_rewards.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/accuracies'] = reward_accuracies.cpu().numpy().tolist()
-            metrics[f'rewards_{train_test}/margins'] = (chosen_rewards - rejected_rewards).cpu().numpy().tolist()
+            metrics[f'rewards_{split_name}/chosen'] = chosen_rewards.cpu().numpy().tolist()
+            metrics[f'rewards_{split_name}/rejected'] = rejected_rewards.cpu().numpy().tolist()
+            metrics[f'rewards_{split_name}/accuracies'] = reward_accuracies.cpu().numpy().tolist()
+            metrics[f'rewards_{split_name}/margins'] = (chosen_rewards - rejected_rewards).cpu().numpy().tolist()
 
         elif loss_config.name == 'sft':
             # policy_chosen_logits = self.policy(batch['chosen_input_ids'], attention_mask=batch['chosen_attention_mask']).logits.to(torch.float32)
@@ -260,12 +266,12 @@ class BasicTrainer(object):
             losses = -policy_chosen_logps
 
         policy_chosen_logps = all_gather_if_needed(policy_chosen_logps.detach(), self.rank, self.world_size)
-        metrics[f'logps_{train_test}/chosen'] = policy_chosen_logps.cpu().numpy().tolist()
+        metrics[f'logps_{split_name}/chosen'] = policy_chosen_logps.cpu().numpy().tolist()
         policy_rejected_logps = all_gather_if_needed(policy_rejected_logps.detach(), self.rank, self.world_size)
-        metrics[f'logps_{train_test}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
+        metrics[f'logps_{split_name}/rejected'] = policy_rejected_logps.cpu().numpy().tolist()
 
         all_devices_losses = all_gather_if_needed(losses.detach(), self.rank, self.world_size)
-        metrics[f'loss/{train_test}'] = all_devices_losses.cpu().numpy().tolist()
+        metrics[f'loss/{split_name}'] = all_devices_losses.cpu().numpy().tolist()
 
         return losses.mean(), metrics
 
@@ -300,33 +306,34 @@ class BasicTrainer(object):
                     if self.config.loss.name in {'dpo', 'ipo'}:
                         reference_text_table = wandb.Table(columns=["step", "prompt", "sample"])
 
-                for eval_batch in (tqdm.tqdm(self.eval_batches, desc='Computing eval metrics') if self.rank == 0 else self.eval_batches):
-                    local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
-                    with torch.no_grad():
-                        _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, train=False)
-
-                    for k, v in eval_metrics.items():
-                        all_eval_metrics[k].extend(v)
-
-                if self.config.sample_during_eval:
-                    if self.config.n_eval_model_samples < self.config.eval_batch_size:
-                        rank0_print(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
-                        sample_batches = self.eval_batches[:1]
-                    else:
-                        n_sample_batches = self.config.n_eval_model_samples // self.config.eval_batch_size
-                        sample_batches = self.eval_batches[:n_sample_batches]
-                    for eval_batch in (tqdm.tqdm(sample_batches, desc='Generating samples...') if self.rank == 0 else sample_batches):
+                for eval_name, eval_batches in self.all_eval_batches.items():
+                    for eval_batch in (tqdm.tqdm(eval_batches, desc='Computing eval metrics') if self.rank == 0 else eval_batches):
                         local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
-                        policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
+                        with torch.no_grad():
+                            _, eval_metrics = self.get_batch_metrics(local_eval_batch, self.config.loss, split_name=f"eval_{eval_name}")
 
-                        all_policy_samples.extend(policy_samples)
-                        all_reference_samples.extend(reference_samples)
+                        for k, v in eval_metrics.items():
+                            all_eval_metrics[k].extend(v)
 
-                        for prompt, sample in zip(eval_batch['prompt'], policy_samples):
-                            policy_text_table.add_data(self.example_counter, prompt, sample)
-                        if self.config.loss.name in {'dpo', 'ipo'}:
-                            for prompt, sample in zip(eval_batch['prompt'], reference_samples):
-                                reference_text_table.add_data(self.example_counter, prompt, sample)
+                    if self.config.sample_during_eval:
+                        if self.config.n_eval_model_samples < self.config.eval_batch_size:
+                            rank0_print(f'Warning: n_eval_model_samples ({self.config.n_eval_model_samples}) < eval_batch_size ({self.config.eval_batch_size}). Sampling from the first complete eval batch of prompts.')
+                            sample_batches = eval_batches[:1]
+                        else:
+                            n_sample_batches = self.config.n_eval_model_samples // self.config.eval_batch_size
+                            sample_batches = eval_batches[:n_sample_batches]
+                        for eval_batch in (tqdm.tqdm(sample_batches, desc='Generating samples...') if self.rank == 0 else sample_batches):
+                            local_eval_batch = slice_and_move_batch_for_device(eval_batch, self.rank, self.world_size, self.rank)
+                            policy_samples, reference_samples = self.get_batch_samples(local_eval_batch)
+
+                            all_policy_samples.extend(policy_samples)
+                            all_reference_samples.extend(reference_samples)
+
+                            for prompt, sample in zip(eval_batch['prompt'], policy_samples):
+                                policy_text_table.add_data(self.example_counter, prompt, sample)
+                            if self.config.loss.name in {'dpo', 'ipo'}:
+                                for prompt, sample in zip(eval_batch['prompt'], reference_samples):
+                                    reference_text_table.add_data(self.example_counter, prompt, sample)
 
                 mean_eval_metrics = {k: sum(v) / len(v) for k, v in all_eval_metrics.items()}
                 rank0_print(f'eval after {self.example_counter}: {formatted_dict(mean_eval_metrics)}')
@@ -360,7 +367,7 @@ class BasicTrainer(object):
             for microbatch_idx in range(self.config.gradient_accumulation_steps):
                 global_microbatch = slice_and_move_batch_for_device(batch, microbatch_idx, self.config.gradient_accumulation_steps, self.rank)
                 local_microbatch = slice_and_move_batch_for_device(global_microbatch, self.rank, self.world_size, self.rank)
-                loss, metrics = self.get_batch_metrics(local_microbatch, self.config.loss, train=True)
+                loss, metrics = self.get_batch_metrics(local_microbatch, self.config.loss, split_name="train")
                 (loss / self.config.gradient_accumulation_steps).backward()
 
                 for k, v in metrics.items():
