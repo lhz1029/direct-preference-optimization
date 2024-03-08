@@ -116,6 +116,28 @@ def get_shp(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str
 
     return data
 
+def get_editor_data(data):
+    """
+    Editor data. Prompt includes candidate response. Each row should be made up of just one pair and two responses,
+    since now each pair should have a separate prompt that contains the dispreferred pair.
+    The value of key "pairs" is still a list of a single tuple, however, to keep the same api.
+
+    """
+    new_data = defaultdict(lambda: defaultdict(list))
+    for prompt in data:
+        responses = data[prompt]["responses"]
+        sft_target = data[prompt]["sft_target"]
+        for pair in data[prompt]["pairs"]:
+            rejected = data[prompt]["responses"][pair[1]]
+            new_prompt = prompt.rsplit("\n\nAssistant:", 1)[0] + "\n\nCandidate Response:" + rejected + "\n\nAssistant:"
+            new_data[new_prompt] = {
+                "pairs": [pair],
+                "responses": [r for i, r in enumerate(responses) if i in pair],
+                "sft_target": sft_target,
+            }
+    del data
+    return new_data
+        
 
 def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     """Load the Anthropic Helpful-Harmless dataset from Huggingface and convert it to the necessary format.
@@ -168,6 +190,12 @@ def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = No
         data = get_hh(split, silent=silent, cache_dir=cache_dir)
     elif name == 'se':
         data = get_se(split, silent=silent, cache_dir=cache_dir)
+    elif name == 'shp_editor':
+        data = get_editor_data(get_shp(split, silent=silent, cache_dir=cache_dir))
+    elif name == 'hh_editor':
+        data = get_editor_data(get_hh(split, silent=silent, cache_dir=cache_dir))
+    elif name == 'se_editor':
+        data = get_editor_data(get_se(split, silent=silent, cache_dir=cache_dir))
     else:
         raise ValueError(f"Unknown dataset '{name}'")
 
@@ -338,33 +366,20 @@ def get_batch_iterator(names: List[str],
         for prompt, responses, pairs, sft_target, truncation_mode in flat_data:
             if done:
                 break
-            if sft_mode:
-                batch_element = tokenize_batch_element(prompt, sft_target, sft_target, truncation_mode, tokenizer, max_length, max_prompt_length)
-                batch_element = {k: v for k, v in batch_element.items() if 'rejected' not in k}
+            # even for sft, we keep track of chosen vs. rejected
+            for p in pairs:
+                if done:
+                    break
+                batch_element = tokenize_batch_element(prompt, responses[p[0]], responses[p[1]], truncation_mode, tokenizer, max_length, max_prompt_length)
                 batch.append(batch_element)
                 example_idx += 1
                 if len(batch) == batch_size:
                     yield collate_fn(batch)
                     if n_examples is not None and example_idx >= n_examples:
                         if not silent:
-                            print(f'Finished generating {n_examples} examples on {split} split')
+                            print(f'FINISHED {n_examples} EXAMPLES on {split} split')
                         done = True
-
                     batch = []
-            else:
-                for p in pairs:
-                    if done:
-                        break
-                    batch_element = tokenize_batch_element(prompt, responses[p[0]], responses[p[1]], truncation_mode, tokenizer, max_length, max_prompt_length)
-                    batch.append(batch_element)
-                    example_idx += 1
-                    if len(batch) == batch_size:
-                        yield collate_fn(batch)
-                        if n_examples is not None and example_idx >= n_examples:
-                            if not silent:
-                                print(f'FINISHED {n_examples} EXAMPLES on {split} split')
-                            done = True
-                        batch = []
         if done:
             break
 
