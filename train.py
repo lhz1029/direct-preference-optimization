@@ -80,6 +80,10 @@ def main(config: DictConfig):
     os.environ['XDG_CACHE_HOME'] = get_local_dir(config.local_dirs)
     print('building policy')
     model_kwargs = {'device_map': 'balanced'} if config.trainer == 'BasicTrainer' else {}
+    model_kwargs["trust_remote_code"] = True
+    model_kwargs["use_auth_token"] = True
+    print("cache_dir", get_local_dir(config.local_dirs))
+    print("local_dirs", config.local_dirs)
     policy_dtype = getattr(torch, config.model.policy_dtype)
     policy = transformers.AutoModelForCausalLM.from_pretrained(
         config.model.name_or_path, cache_dir=get_local_dir(config.local_dirs), low_cpu_mem_usage=True, torch_dtype=policy_dtype, **model_kwargs)
